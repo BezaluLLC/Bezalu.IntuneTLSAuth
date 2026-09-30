@@ -29,8 +29,8 @@ graph TD
 
 Data Flow:
 1. Device (or diagnostic tool) calls `/api/Verify` supplying its public IP via the `CLIENT-IP` header (front door / gateway should inject this).
-2. Function checks Redis for a cached authorized IP list. If stale/missing, it calls the UniFi API (`https://api.ui.com/ea/hosts` with `X-API-KEY = UNIFI_API_TOKEN`) to rebuild.
-3. Returned hosts are parsed → public IPv4 set derived → cached.
+2. Function checks Redis for a cached authorized IP list. If stale/missing, it calls the UniFi API (`https://api.ui.com/ea/hosts` with `X-API-KEY`) once per key configured in `UNIFI_API_TOKEN` to rebuild.
+3. Returned hosts are parsed → public IPv4 set derived per key → merged across all keys → cached.
 4. The provided IP is checked against the combined (API + manual) set.
 5. 200 (OK) on match, 403 otherwise.
 
@@ -103,11 +103,11 @@ Extraction Rules (summarized from `UnifiService`):
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `REDIS_CONNECTION_STRING` | Yes | Host/port string for Azure Cache for Redis. No keys; token auth (Managed Identity) is configured in code. |
-| `UNIFI_API_TOKEN` | Yes | API key injected as `X-API-KEY` header to `https://api.ui.com/ea/hosts`. |
+| `UNIFI_API_TOKEN` | Yes | One or more UniFi API keys, separated by `,` `;` or newlines. Each is sent as the `X-API-KEY` header to `https://api.ui.com/ea/hosts` and the resulting IP sets are merged, so an IP is authorized if it belongs to any key's account. |
 | `UNIFI_CACHE_DURATION_MINUTES` | No | Integer minutes for API IP list cache TTL (default 5). |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | Recommended | Directs telemetry to App Insights. |
 
-Fail‑fast: Missing `REDIS_CONNECTION_STRING` → startup exception. Missing `UNIFI_API_TOKEN` → `InvalidOperationException` when constructing `UnifiService`.
+Fail‑fast: Missing `REDIS_CONNECTION_STRING` → startup exception. Missing or empty `UNIFI_API_TOKEN` → `InvalidOperationException` when constructing `UnifiService`.
 
 ## Response Semantics
 
@@ -146,7 +146,7 @@ Intended usage via Windows Network Policy CSP is functional out of the box.
 3. Provision Azure Cache for Redis (assign necessary access for Managed Identity).
 4. Configure App Settings:
    - `REDIS_CONNECTION_STRING=<redis-hostname>:6380,ssl=True`
-   - `UNIFI_API_TOKEN=<token>`
+   - `UNIFI_API_TOKEN=<token>` (or `<token1>,<token2>` for multiple UniFi accounts)
    - `UNIFI_CACHE_DURATION_MINUTES=5` (optional)
 5. (Optional) Set `APPLICATIONINSIGHTS_CONNECTION_STRING`.
 6. Deploy code (`func azure functionapp publish <name>` or CI workflow).
@@ -157,6 +157,7 @@ Intended usage via Windows Network Policy CSP is functional out of the box.
 |-------|----------|
 | Cache Staleness | 5‑minute window default— adjust for balance between accuracy and API rate. |
 | UniFi Outage | On API failure after cache expiry, decide on fail-open vs fail-closed; currently reliance on cache logic—document desired fallback if implemented. |
+| Multiple API Keys | Keys are queried in parallel. A key that fails (e.g. revoked, 401) is logged and skipped, and the IPs from the remaining keys are cached. The refresh only errors if every key fails. |
 | Telemetry | Use Kusto queries on App Insights traces for success/403 ratios. |
 | Manual Overrides | Supported via internal admin endpoints (intentionally excluded here). |
 | Scale | Function is stateless; Redis centralizes ephemeral data → horizontal scale is safe and encouraged. |

@@ -20,7 +20,8 @@ namespace IntuneTLSDotNet.Services
         ILogger<UnifiService> logger,
         IDistributedCache cache) : IUnifiService
     {
-        private readonly string _apiKey = configuration["UNIFI_API_TOKEN"] ?? throw new InvalidOperationException("UNIFI_API_TOKEN not configured");
+        // UNIFI_API_TOKEN accepts one or more keys separated by commas, semicolons or newlines.
+        private readonly string[] _apiKeys = ParseApiKeys(configuration["UNIFI_API_TOKEN"]);
         private readonly JsonSerializerOptions _json = new() { PropertyNameCaseInsensitive = true };
         private readonly TimeSpan _cacheDuration = TimeSpan.FromMinutes(configuration.GetValue<int?>("UNIFI_CACHE_DURATION_MINUTES") ?? 5);
         private const string CacheKey = "UnifiIpAddressList";
@@ -104,22 +105,62 @@ namespace IntuneTLSDotNet.Services
             return apiIps;
         }
 
+        private static string[] ParseApiKeys(string? raw)
+        {
+            var keys = (raw ?? string.Empty)
+                .Split([',', ';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            return keys.Length > 0 ? keys : throw new InvalidOperationException("UNIFI_API_TOKEN not configured");
+        }
+
+        // Queries the UniFi API once per configured key and unions the results, so an IP
+        // is authorized if it belongs to any account. A failing key is logged and skipped;
+        // the call only fails if every key fails.
         private async Task<List<string>> FetchIpAddressesFromApi()
         {
-            httpClient.DefaultRequestHeaders.Clear();
-            httpClient.DefaultRequestHeaders.Add("X-API-KEY", _apiKey);
+            var results = await Task.WhenAll(_apiKeys.Select(async (key, index) =>
+            {
+                try
+                {
+                    return await FetchIpAddressesForKey(key, index);
+                }
+                catch (Exception ex) when (ex is HttpRequestException or JsonException or TaskCanceledException)
+                {
+                    logger.LogError(ex, "Unifi API request failed for key #{KeyIndex}", index + 1);
+                    return null;
+                }
+            }));
 
-            var response = await httpClient.GetAsync("https://api.ui.com/ea/hosts");
+            var succeeded = results.Where(r => r != null).Select(r => r!).ToList();
+            if (succeeded.Count == 0)
+                throw new InvalidOperationException($"Unifi API request failed for all {_apiKeys.Length} configured key(s)");
+
+            var merged = succeeded
+                .SelectMany(ips => ips)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(ip => ip)
+                .ToList();
+            logger.LogInformation("Merged {Count} IPs from {Succeeded}/{Total} Unifi API key(s)", merged.Count, succeeded.Count, _apiKeys.Length);
+            return merged;
+        }
+
+        private async Task<List<string>> FetchIpAddressesForKey(string apiKey, int index)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.ui.com/ea/hosts");
+            request.Headers.Add("X-API-KEY", apiKey);
+
+            using var response = await httpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
             var content = await response.Content.ReadAsStringAsync();
             var root = JsonSerializer.Deserialize<UnifiResponse>(content, _json);
             if (root?.Data == null)
             {
-                logger.LogWarning("Unifi API returned no data");
+                logger.LogWarning("Unifi API returned no data for key #{KeyIndex}", index + 1);
                 return [];
             }
 
-            logger.LogInformation("Parsed {Count} hosts", root.Data.Count);
+            logger.LogInformation("Parsed {Count} hosts for key #{KeyIndex}", root.Data.Count, index + 1);
             var publicIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var rawIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var host in root.Data)
@@ -141,7 +182,7 @@ namespace IntuneTLSDotNet.Services
                 if (IsPublicIpv4(ip)) publicIps.Add(ip);
             }
             var final = publicIps.Count > 0 ? publicIps : rawIps;
-            logger.LogInformation("Collected {Public} public IPv4s (raw={Raw}) using {Final}", publicIps.Count, rawIps.Count, final.Count);
+            logger.LogInformation("Key #{KeyIndex}: collected {Public} public IPv4s (raw={Raw}) using {Final}", index + 1, publicIps.Count, rawIps.Count, final.Count);
             logger.LogDebug("Sample: {Sample}", string.Join(", ", final.Take(15)));
             return final.OrderBy(ip => ip).ToList();
         }

@@ -14,7 +14,7 @@
   </ItemGroup>
 	<ItemGroup>
 		<FrameworkReference Include="Microsoft.AspNetCore.App" />
-		<PackageReference Include="Azure.Identity" Version="1.17.0" />
+		<PackageReference Include="Azure.Identity" Version="1.21.0" />
 
 		<!-- Add this traditional App Insights integration -->
 		<PackageReference Include="Microsoft.ApplicationInsights.WorkerService" Version="2.23.0" />
